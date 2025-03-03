@@ -1,0 +1,162 @@
+from fuzzywuzzy import process
+import pandas as pd
+import openai
+import re
+
+class FoodScrapQASystem:
+    def __init__(self, csv_path: str, api_key: str):
+        """Initialize the QA system with the dataset and OpenAI API key."""
+        self.df = pd.read_csv(csv_path)
+        self.df = self.df.fillna('Unknown')  # Fill missing values with 'Unknown'
+        
+        # Validation: Fix invalid website entries
+        self.df['website'] = self.df['website'].apply(self.validate_website)
+        openai.api_base = "https://openai.vocareum.com/v1"
+        openai.api_key = api_key
+ 
+    @staticmethod
+    def validate_website(website: str) -> str:
+        # Check if website is valid based on simple patterns
+        if isinstance(website, str) and (website.startswith(('http', 'www')) or '.' in website):
+            return website.strip()
+        return "Website not available"
+
+    def create_context(self, query: str, target_columns: list = None) -> str:
+        """Create a filtered context string based on the query."""
+        if target_columns is None:
+            target_columns = ['ntaname', 'location', 'food_scrap_drop_off_site', 'borough']
+    
+        best_match = None
+        best_score = 0
+        best_column = None
+        filtered_df = None
+    
+        # Preprocess query to make it regex-compatible
+        query_regex = re.sub(r'[^\w\s]', '', query)  # Remove punctuation
+        query_pattern = re.compile(rf'\b{re.escape(query_regex)}\b', re.IGNORECASE)
+    
+        # Perform regex-based or fuzzy matching across all target columns
+        for column in target_columns:
+            if column not in self.df.columns:
+                continue
+            # Regex matching for the `ntaname` column
+            if column == 'ntaname':
+                matched_rows = self.df[self.df[column].str.contains(query_pattern, na=False)]
+                if not matched_rows.empty:
+                    best_match, best_column = query, column
+                    filtered_df = matched_rows
+                    break
+    
+            # Perform fuzzy matching for other columns
+            column_values = self.df[column].tolist()
+            match, score = process.extractOne(query, column_values)
+            if score > best_score:
+                best_match = match
+                best_score = score
+                best_column = column
+    
+        # If no match meets the threshold, return an error message
+        if filtered_df is None and (best_match is None or (best_column != 'ntaname' and best_score < 70)):
+            return "No relevant data found in the dataset."
+            
+        # Filter the DataFrame for non-ntaname columns
+        if filtered_df is None:  # Means regex matching didn't find anything
+            filtered_df = self.df[self.df[best_column].str.strip().str.lower() == best_match.strip().lower()]
+
+        if filtered_df.empty:
+            return "No relevant data found in the dataset."
+    
+        # Generate the context
+        context = "NYC Food Scrap Drop-off Sites Information:\n\n"
+        for _, row in filtered_df.iterrows():
+            # Extract and validate the website field
+            website = row.get('website', '').strip()
+            if not website or website.lower() in ['unknown', 'not available']:
+                website = "Website not available"
+    
+            # Build the site info
+            site_info = {
+                "Matched Column": best_column,
+                "Matched Value": best_match,
+                "Site": row.get('food_scrap_drop_off_site', 'Unknown'),
+                "Borough": row.get('borough', 'Unknown'),
+                "Location": row.get('location', 'Unknown'),
+                "Hours": row.get('operation_day_hours', 'Unknown'),
+                "Hosted by": row.get('hosted_by', 'Unknown'),
+                "Open": row.get('open_months', 'Unknown'),
+                "Website": website,
+                "Latitude": row.get('latitude', 'Unknown'),
+                "Longitude": row.get('longitude', 'Unknown'),
+                "Notes": row.get('notes', 'Unknown'),
+            }
+            context += str(site_info) + "\n\n"
+    
+        return context.strip()
+
+    def generate_prompt(self, query: str, use_custom: bool = True) -> str:
+        """Generate a basic or custom prompt based on user choice."""
+        if use_custom:
+            context = self.create_context(query)
+            return (
+                f"You are a helpful assistant that provides information about NYC Food Scrap Drop-off Sites. "
+                f"Use only the information provided below to answer the question. "
+                f"If you cannot find the specific information in the provided context, say "
+                f"'I don't have enough information to answer that question.'\n\n"
+                f"Context:\n{context}\n\n"
+                f"Question: {query}\n\n"
+                f"Answer the question directly and concisely based only on the information provided above."
+            )
+        else:
+            # Basic prompt without context
+            return f"Answer this question: {query}"
+
+
+    def get_answer(self, query: str, use_custom: bool = True) -> str:
+        """Send the basic or custom prompt to OpenAI and get the response."""
+        prompt = self.generate_prompt(query, use_custom)
+        try:
+            response = openai.Completion.create(
+                engine="gpt-3.5-turbo-instruct",
+                prompt=prompt,
+                temperature=0.3,
+                max_tokens=150,
+                top_p=1.0,
+                frequency_penalty=0.0,
+                presence_penalty=0.0
+            )
+            if "choices" in response and len(response["choices"]) > 0:
+                return response["choices"][0]["text"].strip()
+            else:
+                return "No valid answer found in the response."
+        except Exception as e:
+            return f"Error getting response: {str(e)}"
+
+
+def main():
+    api_key = ""
+    qa_system = FoodScrapQASystem('nyc_food_scrap_drop_off_sites.csv', api_key)
+
+    print("Ask me about NYC food scrap drop-off sites.")
+    print("Type 'basic' to use a basic prompt or 'custom' for a custom prompt.")
+    print("Type 'q' or 'quit' to exit.\n")
+
+    while True:
+        # Ask the user to choose prompt type
+        prompt_type = input("Choose prompt type ('Basic' or 'Custom'): ").strip().lower()
+        if prompt_type not in ['basic', 'custom']:
+            print("Invalid choice. Please type 'Basic' or 'Custom'.")
+            continue
+        # Take the query from the user
+        query = input("Question: ").strip()
+        if query.lower() in ['q', 'quit']:
+            print("Exiting conversation.")
+            break
+
+        use_custom = prompt_type == 'custom'
+        answer = qa_system.get_answer(query, use_custom)
+        print(f"Answer to Custom query: {answer}\n")
+        print('Ask me more, or type "quit" to exit.')
+
+
+if __name__ == '__main__':
+    main()
